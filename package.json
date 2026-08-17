@@ -1,0 +1,18 @@
+{
+  "name": "flo-cloud",
+  "version": "0.1.0",
+  "description": "FloPOS cloud edge-sync receiver (prototype). Bun + Elysia. Implements docs/openapi/flopos-cloud.yaml from the FloROS edge.",
+  "type": "module",
+  "module": "src/server.ts",
+  "scripts": {
+    "dev": "bun run --watch src/server.ts",
+    "start": "bun run src/server.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "elysia": "^1.1.25"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
