@@ -6,8 +6,9 @@ import {
   applyEvents, getCursor, pollCommands, ackCommand, queueCommand, type Sql,
 } from './db';
 import { verifySignature } from './sign';
+import { RelayHub } from './relay';
 
-export function createApp(sql: Sql) {
+export function createApp(sql: Sql, hub: RelayHub = new RelayHub()) {
   // rawBody is captured once per request (signatures are over exact bytes, so we
   // must not re-serialize the parsed body). Handlers parse JSON from rawBody.
   const app = new Elysia()
@@ -76,13 +77,51 @@ export function createApp(sql: Sql) {
     return { ok: true };
   });
 
+  // ── WSS relay — primary cloud→edge push channel ───────────────────────────
+  // Handshake auth is the same HMAC as HTTP, over GET /api/pos/relay with an
+  // empty body. Verified in `open`; a bad handshake closes with 1008.
+  // Elysia hands a fresh ws wrapper per callback, so key state on the stable
+  // underlying Bun socket (`ws.raw`) — which is also what the hub sends on.
+  const socketStore = new WeakMap<object, string>();
+  const rawOf = (ws: any) => (ws.raw ?? ws) as any;
+  app.ws('/api/pos/relay', {
+    async open(ws) {
+      const headers = (ws.data as any).headers as Record<string, string | undefined>;
+      const posHash = headers?.['x-flo-pos-hash'];
+      const store = posHash ? await storeByHash(sql, posHash) : null;
+      if (!store) { ws.close(1008, 'Unknown store'); return; }
+      const nonce = headers['x-flo-nonce'];
+      if (!nonce || !(await claimNonce(sql, nonce))) { ws.close(1008, 'Replay or missing nonce'); return; }
+      const v = verifySignature({ apiKey: store.api_key, method: 'GET', signedPath: '/api/pos/relay', body: '', headers });
+      if (!v.ok) { ws.close(1008, v.error); return; }
+      const raw = rawOf(ws);
+      socketStore.set(raw, store.store_id);
+      hub.register(store.store_id, raw);
+    },
+    async message(ws, message) {
+      const raw = rawOf(ws);
+      const storeId = socketStore.get(raw);
+      if (!storeId) return;
+      await hub.handleMessage(sql, storeId, raw, message);
+    },
+    close(ws) {
+      const raw = rawOf(ws);
+      const storeId = socketStore.get(raw);
+      if (storeId) { hub.unregister(storeId, raw); socketStore.delete(raw); }
+    },
+  });
+
   // Test/admin helper: queue a command (not part of the public edge contract).
+  // Pushes over the relay immediately if the store has a live socket; the HTTP
+  // poll remains the fallback until the edge acks.
   app.post('/internal/commands', async ({ rawBody, set }) => {
     const b = json(rawBody);
     if (!b?.pos_hash || !b?.cmd) { set.status = 400; return { error: 'pos_hash and cmd required' }; }
     const store = await storeByHash(sql, b.pos_hash);
     if (!store) { set.status = 404; return { error: 'Unknown store' }; }
-    return { id: await queueCommand(sql, store.store_id, b.cmd, b.payload) };
+    const id = await queueCommand(sql, store.store_id, b.cmd, b.payload);
+    const pushed = hub.pushCommand(store.store_id, { id, cmd: b.cmd, payload: b.payload });
+    return { id, pushed };
   });
 
   return app;

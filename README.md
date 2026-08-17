@@ -40,6 +40,8 @@ Env:
 - `POST /api/pos/heartbeat`
 - `GET  /api/pos/commands?limit=` — poll (HTTP fallback for the WSS relay)
 - `POST /api/pos/commands/{id}/result` — ack + result (idempotent)
+- `WSS  /api/pos/relay` — primary cloud→edge push (signed handshake). Frames:
+  cloud→edge `{type:command,...}` / `{type:heartbeat_ack}`; edge→cloud `{type:heartbeat}` / `{type:result,id,...}`
 - `POST /internal/commands` — test helper to queue a command (not part of the edge contract)
 
 ## Schema (PostgreSQL)
