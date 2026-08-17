@@ -1,13 +1,22 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'bun:test';
 import { createApp, getCursor } from '../src/server';
-import { openDb } from '../src/db';
+import { connect, initSchema, resetSchema, type Sql } from '../src/db';
 import { buildSignedHeaders } from '../src/sign';
 
 const BASE = 'http://localhost';
 const POS_HASH = 'poshash-abc';
+const TEST_URL = process.env.TEST_DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/flo_cloud_test';
 
-let db: ReturnType<typeof openDb>;
+let sql: Sql;
 let app: ReturnType<typeof createApp>;
+
+beforeAll(async () => {
+  sql = connect(TEST_URL);
+  await initSchema(sql);
+  app = createApp(sql);
+});
+afterAll(async () => { await sql.end(); });
+beforeEach(async () => { await resetSchema(sql); });
 
 async function register() {
   const res = await app.handle(new Request(`${BASE}/api/pos/register`, {
@@ -39,18 +48,13 @@ function sessionEvent(seq: number, type: 'session.opened' | 'session.closed', se
   };
 }
 
-beforeEach(() => {
-  db = openDb(':memory:');
-  app = createApp(db);
-});
-
 describe('onboarding', () => {
   it('register returns store_id + api_key; idempotent per pos_hash', async () => {
     const a = await register();
     expect(a.store_id).toStartWith('st_');
     expect(a.api_key).toStartWith('sk_');
     const b = await register();
-    expect(b.store_id).toBe(a.store_id); // same identity, not duplicated
+    expect(b.store_id).toBe(a.store_id);
   });
 
   it('register without business is 400', async () => {
@@ -72,22 +76,30 @@ describe('events v2 — table_session, idempotency, cursor', () => {
     const body = await res.json();
     expect(body.applied).toBe(2);
     expect(body.applied_seq).toBe(2);
-    expect(getCursor(db, store_id)).toBe(2);
+    expect(await getCursor(sql, store_id)).toBe(2);
   });
 
-  it('re-delivering the same batch is idempotent (dedupe, cursor unchanged)', async () => {
+  it('re-delivering the same batch is idempotent (not applied twice)', async () => {
     const { store_id, api_key } = await register();
     const batch = { pos_hash: POS_HASH, sent_at: '', events: [sessionEvent(1, 'session.opened', 'sess-1')] };
     await signedRequest(api_key, 'POST', '/api/pos/events', batch);
     const res = await signedRequest(api_key, 'POST', '/api/pos/events', batch);
     const body = await res.json();
-    // Re-applied nothing — whether short-circuited by the cursor (seq ≤ last) or
-    // rejected by the unique key, the batch is not applied twice.
     expect(body.applied).toBe(0);
     expect(body.deduped + body.ignored).toBe(1);
-    expect(getCursor(db, store_id)).toBe(1);
-    const count = db.query('SELECT COUNT(*) AS c FROM edge_sync_events WHERE store_id = ?').get(store_id) as any;
-    expect(count.c).toBe(1); // stored once
+    expect(await getCursor(sql, store_id)).toBe(1);
+    const count = await sql`SELECT COUNT(*)::int AS c FROM edge_sync_events WHERE store_id = ${store_id}`;
+    expect(count[0].c).toBe(1);
+  });
+
+  it('dedupes a legacy (unsequenced) event replayed by the same key', async () => {
+    const { api_key } = await register();
+    const order = { id: 'o1', type: 'order.created', entity_type: 'order', entity_id: '1', payload: { total: 100 } };
+    await signedRequest(api_key, 'POST', '/api/pos/events', { pos_hash: POS_HASH, sent_at: '', events: [order] });
+    const res = await signedRequest(api_key, 'POST', '/api/pos/events', { pos_hash: POS_HASH, sent_at: '', events: [order] });
+    const body = await res.json();
+    expect(body.deduped).toBe(1); // synthetic key collides -> unique conflict
+    expect(body.applied).toBe(0);
   });
 
   it('ignores events at or below the cursor (out-of-order safe)', async () => {
@@ -116,7 +128,7 @@ describe('events v2 — table_session, idempotency, cursor', () => {
     const res = await app.handle(new Request(`${BASE}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify({ pos_hash: POS_HASH, sent_at: '', events: [sessionEvent(9, 'session.opened', 'x')] }), // tampered
+      body: JSON.stringify({ pos_hash: POS_HASH, sent_at: '', events: [sessionEvent(9, 'session.opened', 'x')] }),
     }));
     expect(res.status).toBe(401);
   });
@@ -125,7 +137,6 @@ describe('events v2 — table_session, idempotency, cursor', () => {
 describe('commands — poll + result', () => {
   it('polls a queued command and acks its result', async () => {
     const { api_key } = await register();
-    // queue via the internal helper
     const q = await app.handle(new Request(`${BASE}/internal/commands`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pos_hash: POS_HASH, cmd: 'menu.refresh', payload: { since: 0 } }),
@@ -142,7 +153,6 @@ describe('commands — poll + result', () => {
     const ack = await signedRequest(api_key, 'POST', `/api/pos/commands/${id}/result`, { status: 'ok', result: { refreshed: true } });
     expect(ack.status).toBe(200);
 
-    // once acked, it is no longer returned by the poll
     const poll2 = await signedRequest(api_key, 'GET', '/api/pos/commands?limit=5');
     expect((await poll2.json()).commands.length).toBe(0);
   });
