@@ -1,5 +1,5 @@
 # flo-cloud — edge-sync receiver (prototype)
-n[![CI](https://github.com/ChayBB/flo-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/ChayBB/flo-cloud/actions/workflows/ci.yml)
+[![CI](https://github.com/ChayBB/flo-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/ChayBB/flo-cloud/actions/workflows/ci.yml)
 
 Bun + Elysia + **PostgreSQL** prototype of the FloPOS **cloud** side of the
 restaurant-OS edge-sync protocol. Implements the contract in the FloROS repo
